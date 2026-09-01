@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,6 +33,7 @@ import (
 	hamba "github.com/hamba/avro/v2"
 	"github.com/hamba/avro/v2/ocf"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestReader(t *testing.T) {
@@ -275,6 +277,92 @@ func TestOCFReaderBytesValues(t *testing.T) {
 	nullable := rec.Column(1).(*array.Binary)
 	assert.Equal(t, payload, nullable.Value(0))
 	assert.True(t, nullable.IsNull(1))
+}
+
+func TestOCFReaderWithMaxByteSliceSize(t *testing.T) {
+	const valueSize = 1_048_577
+	schema := `{
+		"type": "record",
+		"name": "rec",
+		"fields": [{"name": "value", "type": "string"}]
+	}`
+	value := strings.Repeat("x", valueSize)
+
+	var buf bytes.Buffer
+	enc, err := ocf.NewEncoder(schema, &buf)
+	require.NoError(t, err)
+	require.NoError(t, enc.Encode(map[string]any{"value": value}))
+	require.NoError(t, enc.Close())
+
+	t.Run("default limit rejects the value", func(t *testing.T) {
+		r, err := NewOCFReader(bytes.NewReader(buf.Bytes()))
+		require.NoError(t, err)
+		defer r.Close()
+
+		assert.False(t, r.Next())
+		assert.ErrorContains(t, r.Err(), "size is greater than `Config.MaxByteSliceSize`")
+	})
+
+	t.Run("configured limit is enforced", func(t *testing.T) {
+		r, err := NewOCFReader(bytes.NewReader(buf.Bytes()), WithMaxByteSliceSize(valueSize-1))
+		require.NoError(t, err)
+		defer r.Close()
+
+		assert.False(t, r.Next())
+		assert.ErrorContains(t, r.Err(), "size is greater than `Config.MaxByteSliceSize`")
+	})
+
+	t.Run("configured limit accepts the value", func(t *testing.T) {
+		r, err := NewOCFReader(bytes.NewReader(buf.Bytes()), WithMaxByteSliceSize(valueSize))
+		require.NoError(t, err)
+		defer r.Close()
+
+		require.True(t, r.Next())
+		assert.NoError(t, r.Err())
+		got := r.RecordBatch().Column(0).(*array.String).Value(0)
+		assert.Equal(t, value, got)
+	})
+
+	t.Run("negative limit disables the check", func(t *testing.T) {
+		r, err := NewOCFReader(bytes.NewReader(buf.Bytes()), WithMaxByteSliceSize(-1))
+		require.NoError(t, err)
+		defer r.Close()
+
+		require.True(t, r.Next())
+		assert.NoError(t, r.Err())
+		got := r.RecordBatch().Column(0).(*array.String).Value(0)
+		assert.Equal(t, value, got)
+	})
+}
+
+func TestOCFReaderReuseWithMaxByteSliceSize(t *testing.T) {
+	const valueSize = 1_048_577
+	schema := `{
+		"type": "record",
+		"name": "rec",
+		"fields": [{"name": "value", "type": "string"}]
+	}`
+	encode := func(value string) []byte {
+		var buf bytes.Buffer
+		enc, err := ocf.NewEncoder(schema, &buf)
+		require.NoError(t, err)
+		require.NoError(t, enc.Encode(map[string]any{"value": value}))
+		require.NoError(t, enc.Close())
+		return buf.Bytes()
+	}
+
+	r, err := NewOCFReader(bytes.NewReader(encode("small")))
+	require.NoError(t, err)
+	defer r.Close()
+	require.True(t, r.Next())
+	assert.NoError(t, r.Err())
+
+	value := strings.Repeat("x", valueSize)
+	require.NoError(t, r.Reuse(bytes.NewReader(encode(value)), WithMaxByteSliceSize(valueSize)))
+	require.True(t, r.Next())
+	assert.NoError(t, r.Err())
+	got := r.RecordBatch().Column(0).(*array.String).Value(0)
+	assert.Equal(t, value, got)
 }
 
 func TestOCFReaderNullableTimestamps(t *testing.T) {

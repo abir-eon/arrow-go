@@ -74,21 +74,16 @@ type OCFReader struct {
 
 	bldDone chan struct{}
 
-	recChanSize int
-	chunk       int
-	mem         memory.Allocator
+	recChanSize      int
+	chunk            int
+	mem              memory.Allocator
+	maxByteSliceSize int
 }
 
 // NewReader returns a reader that reads from an Avro OCF file and creates
 // arrow.RecordBatches from the converted avro data.
 func NewOCFReader(r io.Reader, opts ...Option) (*OCFReader, error) {
-	ocfr, err := ocf.NewDecoder(r)
-	if err != nil {
-		return nil, fmt.Errorf("%w: could not create avro ocfreader", arrow.ErrInvalid)
-	}
-
 	rr := &OCFReader{
-		r:            ocfr,
 		chunk:        1,
 		avroChanSize: 500,
 		recChanSize:  10,
@@ -98,6 +93,11 @@ func NewOCFReader(r io.Reader, opts ...Option) (*OCFReader, error) {
 	for _, opt := range opts {
 		opt(rr)
 	}
+	ocfr, err := rr.newOCFDecoder(r)
+	if err != nil {
+		return nil, fmt.Errorf("%w: could not create avro ocfreader", arrow.ErrInvalid)
+	}
+	rr.r = ocfr
 
 	rr.avroChan = make(chan any, rr.avroChanSize)
 	rr.recChan = make(chan arrow.RecordBatch, rr.recChanSize)
@@ -147,7 +147,10 @@ func NewOCFReader(r io.Reader, opts ...Option) (*OCFReader, error) {
 func (rr *OCFReader) Reuse(r io.Reader, opts ...Option) error {
 	rr.Close()
 	rr.err = nil
-	ocfr, err := ocf.NewDecoder(r)
+	for _, opt := range opts {
+		opt(rr)
+	}
+	ocfr, err := rr.newOCFDecoder(r)
 	if err != nil {
 		return fmt.Errorf("%w: could not create avro ocfreader", arrow.ErrInvalid)
 	}
@@ -160,9 +163,6 @@ func (rr *OCFReader) Reuse(r io.Reader, opts ...Option) error {
 	}
 
 	rr.r = ocfr
-	for _, opt := range opts {
-		opt(rr)
-	}
 
 	rr.maxOCF = 0
 	rr.maxRec = 0
@@ -177,6 +177,11 @@ func (rr *OCFReader) Reuse(r io.Reader, opts ...Option) error {
 	go rr.decodeOCFToChan()
 	go rr.recordFactory()
 	return nil
+}
+
+func (rr *OCFReader) newOCFDecoder(r io.Reader) (*ocf.Decoder, error) {
+	decoderConfig := avro.Config{MaxByteSliceSize: rr.maxByteSliceSize}.Freeze()
+	return ocf.NewDecoder(r, ocf.WithDecoderConfig(decoderConfig))
 }
 
 // Err returns the last error encountered during the iteration over the
@@ -268,6 +273,14 @@ func (r *OCFReader) Next() bool {
 func WithAllocator(mem memory.Allocator) Option {
 	return func(cfg config) {
 		cfg.mem = mem
+	}
+}
+
+// WithMaxByteSliceSize specifies the maximum size of bytes and string values
+// created while decoding. A negative value disables the limit. The default is 1 MiB.
+func WithMaxByteSliceSize(n int) Option {
+	return func(cfg config) {
+		cfg.maxByteSliceSize = n
 	}
 }
 
